@@ -25,6 +25,7 @@
 #include <assert.h>
 #include <sys/ioctl.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <transport_usb.h>
 #include <platform.h>
@@ -32,6 +33,7 @@
 #include <debug.h>
 #include <log.h>
 #include <sys/queue.h>
+#include <sys/inotify.h>
 
 #include <linux/usbdevice_fs.h>
 #include "../novacom/mux.h"
@@ -186,7 +188,7 @@ static int novacom_usb_find_endpoints(usb_dev_handle *handle, int eps[2], int *i
 	return -1;
 }
 
-static novacom_usb_handle_t *novacom_usb_open( void )
+static novacom_usb_handle_t *novacom_usb_open(const char *busname, const char *devname)
 {
 	int rc;
 
@@ -210,6 +212,13 @@ static novacom_usb_handle_t *novacom_usb_open( void )
 					dev->devnum, dev->filename, 
 					dev->descriptor.idVendor, dev->descriptor.idProduct);
 #endif
+			/* ignore all other devices if specific bus/device given */
+			if (busname != NULL && devname != NULL) {
+				if (strcmp(bus->dirname, busname) != 0 || strcmp(dev->filename, devname) != 0) {
+					continue;
+				}
+			}
+
 			/* try to match against our list of vendor/products */
 			uint i;
 			for (i=0; usbid_list[i].name; i++) {
@@ -563,6 +572,130 @@ static void *novacom_usb_rx_thread(void *arg)
 	return NULL;
 }
 
+struct novacom_usb_inotify_entry
+{
+	/* watch descriptor */
+	int wd;
+	/* bus number (dirname) */
+	char *bus;
+	SLIST_ENTRY(novacom_usb_inotify_entry) entries;
+};
+
+struct novacom_usb_inotify_context
+{
+	/* inotify fd */
+	int fd;
+	/* buffer to read inotify event (big enough to fit one event) */
+	char event_buf[sizeof(struct inotify_event) + NAME_MAX + 1];
+	/* inotify watch descriptors */
+	SLIST_HEAD(wds_s, novacom_usb_inotify_entry) wds;
+};
+
+/*
+ * @brief test that given name is invalid USB busname
+ * @ret -1 error
+ *       0 success (name contains only digits)
+ */
+static int novacom_usb_is_invalid_bus_name(const char *name)
+{
+	while(*name) {
+		if (!isdigit(*name))
+			return -1;
+		++name;
+	}
+	return 0;
+}
+
+/*
+ * @brief add inotify watches to track USB device additions
+ * @ret -1 error
+ *       0 success
+ */
+static int novacom_usb_inotify_context_init(struct novacom_usb_inotify_context *context)
+{
+	context->fd = inotify_init();
+	if (context->fd == -1) {
+		TRACEF("inotify_init failed\n");
+		return -1;
+	}
+
+	const char *DEV_USB = "/dev/bus/usb/";
+	DIR *dusb = opendir(DEV_USB);
+	struct dirent *dentry;
+	char path[PATH_MAX];
+
+	for (dentry = readdir(dusb); dentry; dentry = readdir(dusb)) {
+		if (dentry->d_type != DT_DIR) {
+			continue;
+		}
+		if (novacom_usb_is_invalid_bus_name(dentry->d_name)) {
+			continue;
+		}
+
+		strcpy(path, DEV_USB);
+		strcat(path, dentry->d_name);
+		int wd = inotify_add_watch(context->fd, path, IN_CREATE);
+		if (wd == -1) {
+			TRACEF("inotify_add_watch failed for path: %s, error: %s\n", path, strerror(errno));
+			return -1;
+		}
+		struct novacom_usb_inotify_entry *entry = (struct novacom_usb_inotify_entry *)platform_alloc(sizeof(struct novacom_usb_inotify_entry));
+		entry->wd = wd;
+		entry->bus = platform_strdup(dentry->d_name);
+		SLIST_INSERT_HEAD(&context->wds, entry, entries);
+	}
+	closedir(dusb);
+
+	return 0;
+}
+
+/*
+ * @brief cleanup inotify context, destroy watches and close inotify fd
+ */
+static void novacom_usb_inotify_context_destroy(struct novacom_usb_inotify_context *context)
+{
+	struct novacom_usb_inotify_entry *entry;
+	SLIST_FOREACH(entry, &context->wds, entries) {
+		platform_free(entry->bus);
+		int rc = inotify_rm_watch(context->fd, entry->wd);
+		if (rc == -1) {
+			TRACEF("inotify_rm_watch failed: %s\n", strerror(errno));
+		}
+		platform_free(entry);
+	}
+	close(context->fd);
+}
+
+/*
+ * @brief wait for inotify event when new USB device added.
+ * @ret -1 error
+ *       0 success, busname and devname contains assigned path names for added device
+ */
+static int novacom_usb_inotify_context_read(struct novacom_usb_inotify_context *context, const char **busname, const char **devname)
+{
+	platform_assert(context->fd != -1);
+	int bytes = read(context->fd, context->event_buf, sizeof(context->event_buf));
+	if (bytes < 0) {
+		TRACEF("failed to read from inotify fd (errno: %s)\n", strerror(errno));
+		return -1;
+	}
+	struct inotify_event *event = (struct inotify_event *)context->event_buf;
+	platform_assert(event->mask & IN_CREATE);
+	platform_assert(event->len > 0);
+
+	*devname = event->name;
+
+	struct novacom_usb_inotify_entry *entry;
+	SLIST_FOREACH(entry, &context->wds, entries) {
+		if (entry->wd == event->wd) {
+			*busname = entry->bus;
+			TRACEF("device added: bus: %s, device: %s\n", *busname, *devname);
+			return 0;
+		}
+	}
+	return -1;
+}
+
 /* main worker thread */
 static void *novacom_usb_findandattach_thread(void *arg)
 {
@@ -574,10 +707,20 @@ static void *novacom_usb_findandattach_thread(void *arg)
 	/* initialize records queue */
 	TAILQ_INIT(&t_recovery_queue);
 
+	struct novacom_usb_inotify_context inotify_context;
+	novacom_usb_inotify_context_init(&inotify_context);
+
+	/* busname/devname == NULL, let novacom_usb_open do full device discovery */
+	const char *busname = NULL;
+	const char *devname = NULL;
+
+	platform_time_t time_prev;
+	platform_get_time(&time_prev);
+
 	/* device discovery */
 	while (!novacom_shutdown) {
 
-		usb = novacom_usb_open();
+		usb = novacom_usb_open(busname, devname);
 		if (usb ) {
 			usb->shutdown = false;
 			TRACEF("usb_handle 0x%08x, bus=%03d dev=%03d\n", usb->usbll_handle, usb->busnum, usb->devnum);
@@ -590,13 +733,23 @@ static void *novacom_usb_findandattach_thread(void *arg)
 			platform_create_thread(NULL, &novacom_usb_rx_thread, (void *)usb);
 			platform_create_thread(NULL, &novacom_usb_tx_thread, (void *)usb);
 		}
-	
+
+		/* wait for new devices */
+		novacom_usb_inotify_context_read(&inotify_context, &busname, &devname);
+
 		if (!novacom_shutdown) {
-			sleep(1); // dont peg the cpu waiting for usb
-			/* check recovery records, shutdown interface if timeout expired */
-			(void) usbrecords_update( 1 );	/* assume 1sec delay */
+			platform_time_t time_cur;
+			platform_get_time(&time_cur);
+			const int elapsed_sec = platform_delta_time_msecs(&time_prev, &time_cur) / 1000;
+			if (elapsed_sec > 0) {
+				time_prev = time_cur;
+				/* check recovery records, shutdown interface if timeout expired */
+				(void) usbrecords_update(elapsed_sec);
+			}
 		}
 	}
+
+	novacom_usb_inotify_context_destroy(&inotify_context);
 
 	/* update records: forcing shutdown of all records */
 	usbrecords_update(TRANSPORT_RECOVERY_TIMEOUT);
